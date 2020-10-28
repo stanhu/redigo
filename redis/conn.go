@@ -75,17 +75,26 @@ type DialOption struct {
 }
 
 type dialOptions struct {
-	readTimeout  time.Duration
-	writeTimeout time.Duration
-	dialer       *net.Dialer
-	dialContext  func(ctx context.Context, network, addr string) (net.Conn, error)
-	db           int
-	username     string
-	password     string
-	clientName   string
-	useTLS       bool
-	skipVerify   bool
-	tlsConfig    *tls.Config
+	readTimeout         time.Duration
+	writeTimeout        time.Duration
+	tlsHandshakeTimeout time.Duration
+	dialer              *net.Dialer
+	dialContext         func(ctx context.Context, network, addr string) (net.Conn, error)
+	db                  int
+	username            string
+	password            string
+	clientName          string
+	useTLS              bool
+	skipVerify          bool
+	tlsConfig           *tls.Config
+}
+
+// DialTLSHandshakeTimeout specifies the maximum amount of time waiting to
+// wait for a TLS handshake. Zero means no timeout.
+func DialTLSHandshakeTimeout(d time.Duration) DialOption {
+	return DialOption{func(do *dialOptions) {
+		do.tlsHandshakeTimeout = d
+	}}
 }
 
 // DialReadTimeout specifies the timeout for reading a single command reply.
@@ -201,6 +210,12 @@ func Dial(network, address string, options ...DialOption) (Conn, error) {
 	return DialContext(context.Background(), network, address, options...)
 }
 
+type tlsHandshakeTimeoutError struct{}
+
+func (tlsHandshakeTimeoutError) Timeout() bool   { return true }
+func (tlsHandshakeTimeoutError) Temporary() bool { return true }
+func (tlsHandshakeTimeoutError) Error() string   { return "TLS handshake timeout" }
+
 // DialContext connects to the Redis server at the given network and
 // address using the specified options and context.
 func DialContext(ctx context.Context, network, address string, options ...DialOption) (Conn, error) {
@@ -238,10 +253,26 @@ func DialContext(ctx context.Context, network, address string, options ...DialOp
 		}
 
 		tlsConn := tls.Client(netConn, tlsConfig)
-		if err := tlsConn.Handshake(); err != nil {
-			netConn.Close()
+
+		errc := make(chan error, 2)
+		var timer *time.Timer // for cancelling TLS handshake
+		if d := do.tlsHandshakeTimeout; d != 0 {
+			timer = time.AfterFunc(d, func() {
+				errc <- tlsHandshakeTimeoutError{}
+			})
+		}
+		go func() {
+			err := tlsConn.Handshake()
+			if timer != nil {
+				timer.Stop()
+			}
+			errc <- err
+		}()
+		if err := <-errc; err != nil {
+			netConn.Close() // nolint: errcheck
 			return nil, err
 		}
+
 		netConn = tlsConn
 	}
 
